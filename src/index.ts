@@ -1,16 +1,26 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from "dotenv";
-import express from "express";
+import express, { type Response as ExpressResponse } from "express";
 import axios from "axios";
 import { SummarizeRequest } from "./interface/summarize.js";
+import cors from "cors";
 
 dotenv.config();
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const API_KEY = process.env.GEMINI_API_KEY;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+if (!API_KEY || !YOUTUBE_API_KEY) {
+  throw new Error(
+    "One or more required API keys are not set in environment variables",
+  );
+}
+const genAI = new GoogleGenerativeAI(API_KEY);
+
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
+app.use(cors());
 app.use(express.json());
 
 app.get("/health", (req, res) => {
@@ -22,16 +32,16 @@ app.post("/summarize", async (req, res) => {
   const { url } = body;
 
   if (!url || typeof url !== "string") {
-    res.status(400).json({ error: "URL is invalid or null" });
-    return;
+    return res.status(400).json({ error: "URL is invalid or null" });
   }
 
   try {
     const processedUrl = new URL(url);
     await _conductSummarize(processedUrl, res);
-  } catch {
-    res.status(400).json({ error: "Invalid URL, please enter valid URL" });
-    return;
+  } catch (e) {
+    return res
+      .status(400)
+      .json({ error: "Invalid URL, please enter valid URL" });
   }
 });
 
@@ -39,57 +49,82 @@ app.listen(PORT, () => {
   console.log(`Server is running on : http://localhost:${PORT}`);
 });
 
-async function _conductSummarize(url: URL, response: any): Promise<void> {
+async function _conductSummarize(
+  originalUrl: URL,
+  response: ExpressResponse,
+): Promise<void> {
+  const isYoutube: boolean = [
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+  ].some((e) => originalUrl.hostname.includes(e));
+
   try {
-    const jinaUrl = `https://r.jina.ai/${url.href}`;
-    const result = await _getGenerateContentWithWeb(jinaUrl);
+    const url = isYoutube
+      ? originalUrl
+      : `https://r.jina.ai/${originalUrl.href}`;
+    const result = await _getGenerateContent(url, isYoutube);
     response.json({ result });
   } catch (e) {
     // if 451 error occurred, use normal url
     if (axios.isAxiosError(e) && e.response?.status === 451) {
       try {
-        const result = await _getGenerateContentWithWeb(url.href);
+        const result = await _getGenerateContent(originalUrl.href, isYoutube);
         console.warn(
           "Warning: Security compromise error. We have not authority to access this site",
         );
-        return response.json({ result });
+        response.json({ result });
+        return;
       } catch (e) {
         console.error(e);
         response.status(500).json({ error: "Failed to summarize" });
+        return;
       }
     }
     console.error(e);
     response.status(500).json({ error: "Failed to summarize" });
+    return;
   }
 }
 
-async function _getGenerateContentWithYoutube(url: string): Promise<string> {
-  const response = await axios.get(url);
-  const prompt = `
-  以下のYouTube動画の字幕データから、動画の内容を日本語で要約してください。
- 【出力構成】
-  1. 一言でいうと：動画のメインテーマを30文字以内で
-  2. 重要なポイント：箇条書きで3〜5点
-  3. まとめ：どういう内容なのか
+async function _getGenerateContent(
+  url: any,
+  isYoutube: boolean,
+): Promise<string> {
+  if (isYoutube) {
+    const videoId = url.searchParams.get("v") || url.pathname.slice(1);
+    if (!videoId || videoId === "watch") {
+      throw new Error("Invalid Youtube URL");
+    }
 
- 【字幕データ】
- ${response}
- `;
-  return (await model.generateContent(prompt)).response.text();
+    const apiUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}&key=${YOUTUBE_API_KEY}`;
+    const apiResponse = await axios.get(apiUrl);
+    const item = apiResponse.data.items[0];
+    if (!item) {
+      throw new Error("Video not found please check the URL");
+    }
+    const snippet = item.snippet;
+    const info = `
+    動画タイトル: ${snippet.title}
+    チャンネル名: ${snippet.channelTitle}
+    動画の説明文: ${snippet.description}
+  `;
+
+    return await _askGemini(info, true);
+  } else {
+    const contents = await axios.get(url);
+    return await _askGemini(contents.data);
+  }
 }
 
-async function _getGenerateContentWithWeb(url: string): Promise<string> {
-  const response = await axios.get(url);
-  const prompt = `
-  以下のWebサイトの内容を、重要なポイントを逃さず日本語で要約してください。
-
- 【出力のルール】
- ・最初に「この記事が何を伝えているか」を1文で説明してください。
- ・次に、重要な詳細を箇条書きで3つ程度にまとめてください。
- ・AIの事前知識は使わず、以下の【提供された情報】のみをもとに記述してください。
-
- 【提供された情報】:
- ${response.data}
- `;
+async function _askGemini(
+  contents: string,
+  isYoutube: boolean = false,
+): Promise<string> {
+  const subInfo = isYoutube ? "動画" : "サイト";
+  const prompt = `以下の情報をもとに${subInfo}の内容を、わかりやすく要約してください
+【内容】
+${contents}
+`;
   return (await model.generateContent(prompt)).response.text();
 }
