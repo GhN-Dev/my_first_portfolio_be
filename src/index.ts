@@ -32,16 +32,18 @@ app.post("/summarize", async (req, res) => {
   const { url } = body;
 
   if (!url || typeof url !== "string") {
-    return res.status(400).json({ error: "URL is invalid or null" });
+    return res
+      .status(422)
+      .json({ error: "Invalid input", details: "URL must be a string" });
   }
 
   try {
     const processedUrl = new URL(url);
-    await _conductSummarize(processedUrl, res);
-  } catch (e) {
-    return res
-      .status(400)
-      .json({ error: "Invalid URL, please enter valid URL" });
+    const result = await _conductSummarize(processedUrl);
+    return res.json({ result });
+  } catch (e: any) {
+    const statusCode = e.name === "ValidationError" ? 422 : 500;
+    return res.status(statusCode).json({ error: e.message });
   }
 });
 
@@ -49,10 +51,7 @@ app.listen(PORT, () => {
   console.log(`Server is running on : http://localhost:${PORT}`);
 });
 
-async function _conductSummarize(
-  originalUrl: URL,
-  response: ExpressResponse,
-): Promise<void> {
+async function _conductSummarize(originalUrl: URL): Promise<string> {
   const isYoutube: boolean = [
     "youtube.com",
     "www.youtube.com",
@@ -63,57 +62,76 @@ async function _conductSummarize(
     const url = isYoutube
       ? originalUrl
       : `https://r.jina.ai/${originalUrl.href}`;
-    const result = await _getGenerateContent(url, isYoutube);
-    response.json({ result });
+    return await _getGenerateContent(url, isYoutube);
   } catch (e) {
-    // if 451 error occurred, use normal url
     if (axios.isAxiosError(e) && e.response?.status === 451) {
-      try {
-        const result = await _getGenerateContent(originalUrl.href, isYoutube);
-        console.warn(
-          "Warning: Security compromise error. We have not authority to access this site",
-        );
-        response.json({ result });
-        return;
-      } catch (e) {
-        console.error(e);
-        response.status(500).json({ error: "Failed to summarize" });
-        return;
-      }
+      console.warn(
+        "Warning: Security compromise error. We have not authority to access this site",
+      );
+      return await _getGenerateContent(originalUrl.href, isYoutube);
     }
-    console.error(e);
-    response.status(500).json({ error: "Failed to summarize" });
-    return;
+    throw e;
   }
 }
 
 async function _getGenerateContent(
-  url: any,
+  url: URL | string,
   isYoutube: boolean,
 ): Promise<string> {
   if (isYoutube) {
-    const videoId = url.searchParams.get("v") || url.pathname.slice(1);
-    if (!videoId || videoId === "watch") {
-      throw new Error("Invalid Youtube URL");
-    }
+    const targetUrl = typeof url === "string" ? new URL(url) : url;
+    const videoInfo = await _extractYoutubeVideoInfo(targetUrl);
+    return await _askGemini(videoInfo, true);
+  } else {
+    const targetUrlString = typeof url === "string" ? url : url.href;
+    const contents = await axios.get(targetUrlString);
+    return await _askGemini(contents.data);
+  }
+}
 
-    const apiUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}&key=${YOUTUBE_API_KEY}`;
-    const apiResponse = await axios.get(apiUrl);
+async function _extractYoutubeVideoInfo(url: URL): Promise<string> {
+  const vParam = url.searchParams.get("v");
+  const match = url.pathname.match(
+    /(?:^\/|\/shorts\/|\/live\/)([a-zA-Z0-9_-]{11})(?:$|\/|\?)/,
+  );
+  const videoId = vParam ? vParam : match ? match[1] : null;
+
+  if (!videoId)
+    throw new Error(
+      "動画IDが見つかりません。有効なYouTube URLを入力してください。",
+    );
+
+  const apiUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${videoId}`;
+  try {
+    const apiResponse = await axios.get(apiUrl, {
+      headers: {
+        "X-Goog-Api-Key": YOUTUBE_API_KEY,
+      },
+    });
+
     const item = apiResponse.data.items[0];
-    if (!item) {
-      throw new Error("Video not found please check the URL");
-    }
+    if (!item) throw new Error("Video not found please check the URL");
+
     const snippet = item.snippet;
-    const info = `
+    return `
     動画タイトル: ${snippet.title}
     チャンネル名: ${snippet.channelTitle}
     動画の説明文: ${snippet.description}
   `;
-
-    return await _askGemini(info, true);
-  } else {
-    const contents = await axios.get(url);
-    return await _askGemini(contents.data);
+  } catch (e) {
+    if (axios.isAxiosError(e)) {
+      switch (e.response?.status) {
+        case 403:
+          throw new Error(
+            "You reached the Youtube Data API quota limit. Please try again later or check your API key",
+          );
+        case 404:
+          throw new Error("Video not found. Please check the URL");
+      }
+    }
+    throw new Error(
+      `Error occurred while requesting YouTube Data API: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 }
 
@@ -121,10 +139,8 @@ async function _askGemini(
   contents: string,
   isYoutube: boolean = false,
 ): Promise<string> {
-  const subInfo = isYoutube ? "動画" : "サイト";
-  const prompt = `以下の情報をもとに${subInfo}の内容を、わかりやすく要約してください
-【内容】
-${contents}
-`;
+  const prompt = isYoutube
+    ? `以下のYouTube動画のメタデータ（タイトルと概要欄）から、動画の【主旨】と【重要なポイント】を3〜5行で要約してください。宣伝やリンクは無視してください。\n\n${contents}`
+    : `以下のWeb記事のテキストから、重要な情報を抽出し、見出しをつけて分かりやすく構造化して要約してください。400文字程度で。\n\n${contents}`;
   return (await model.generateContent(prompt)).response.text();
 }
